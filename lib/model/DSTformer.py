@@ -8,6 +8,18 @@ from collections import OrderedDict
 from functools import partial
 from itertools import repeat
 from lib.model.drop import DropPath
+import einops
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    flash_attn_func = None
+
+    
+def init_(tensor: torch.Tensor):
+    dim = tensor.shape[-1]
+    std = 1 / math.sqrt(dim)
+    tensor.uniform_(-std, std)
+    return tensor
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
@@ -86,14 +98,21 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., st_mode='vanilla'):
+    def __init__(self, dim, seq_len, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., st_mode='vanilla', use_flash=False, reduction = 0 ):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
         self.scale = qk_scale or head_dim ** -0.5
 
-        self.attn_drop = nn.Dropout(attn_drop)
+        self.use_flash = use_flash
+        self.use_lin = reduction > 0
+        self.seq_len = seq_len
+        
+        if not self.use_flash: 
+            self.attn_drop = nn.Dropout(attn_drop)
+        else:
+            self.attn_drop = attn_drop
         self.proj = nn.Linear(dim, dim)
         self.mode = st_mode
         if self.mode == 'parallel':
@@ -101,10 +120,33 @@ class Attention(nn.Module):
             self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         else:
             self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj_drop = nn.Dropout(proj_drop)
 
         self.attn_count_s = None
         self.attn_count_t = None
+
+        if self.use_lin:
+            self.proj_k = nn.Parameter(init_(torch.zeros(self.seq_len, reduction)))
+            self.proj_v = nn.Parameter(init_(torch.zeros(self.seq_len, reduction)))
+
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def atten(self, q, k, v):
+        if self.use_flash:
+            # print(q.shape)  
+            # calculate atten
+            q = einops.rearrange(q, 'b h s d -> b s h d')
+            k = einops.rearrange(k, 'b h s d -> b s h d')
+            v = einops.rearrange(v, 'b h s d -> b s h d')
+            x = flash_attn_func(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), self.attn_drop, self.scale).to(torch.float32)
+            x = einops.rearrange(x, 'b s h d -> b h s d')
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+
+            x = attn @ v
+        return x
+            
 
     def forward(self, x, seqlen=1):
         B, N, C = x.shape
@@ -166,22 +208,14 @@ class Attention(nn.Module):
         k = self.reshape_T(k, seqlen)
         v = self.reshape_T(v, seqlen)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = attn @ v
+        x = self.atten(q, k, v)
         x = self.reshape_T(x, seqlen, inverse=True)
         x = x.transpose(1,2).reshape(BT, N, C*self.num_heads)
         return x
 
     def forward_spatial(self, q, k, v):
         B, _, N, C = q.shape
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = attn @ v
+        x = self.atten(q, k, v)
         x = x.transpose(1,2).reshape(B, N, C*self.num_heads)
         return x
         
@@ -191,11 +225,11 @@ class Attention(nn.Module):
         kt = k.reshape(-1, seqlen, self.num_heads, N, C).permute(0, 2, 3, 1, 4) #(B, H, N, T, C)
         vt = v.reshape(-1, seqlen, self.num_heads, N, C).permute(0, 2, 3, 1, 4) #(B, H, N, T, C)
 
-        attn = (qt @ kt.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = attn @ vt #(B, H, N, T, C)
+        if self.use_lin:
+            kt = torch.einsum('bwsnd,nk->bwskd', kt, self.proj_k)
+            vt = torch.einsum('bwsnd,nk->bwskd', vt, self.proj_v)
+        
+        x = self.atten(qt, kt, vt)
         x = x.permute(0, 3, 2, 1, 4).reshape(B, N, C*self.num_heads)
         return x
 
@@ -213,17 +247,17 @@ class Attention(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, dim, num_heads, mlp_ratio=4., mlp_out_ratio=1., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, st_mode='stage_st', att_fuse=False):
+    def __init__(self, dim, num_heads, temporal_len, mlp_ratio=4., mlp_out_ratio=1., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, st_mode='stage_st', att_fuse=False, reduction=0, use_flash=False):
         super().__init__()
         # assert 'stage' in st_mode
         self.st_mode = st_mode
         self.norm1_s = norm_layer(dim)
         self.norm1_t = norm_layer(dim)
         self.attn_s = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, st_mode="spatial")
+            dim, seq_len=temporal_len, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, st_mode="spatial", reduction=reduction, use_flash=use_flash)
         self.attn_t = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, st_mode="temporal")
+            dim, seq_len=temporal_len, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, st_mode="temporal", reduction=reduction, use_flash=use_flash)
         
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -265,29 +299,80 @@ class Block(nn.Module):
         else:
             raise NotImplementedError(self.st_mode)
         return x
+class TemporalCompressor(nn.Module):
+    def __init__(self, in_dims, num_joints):
+        super().__init__()
+
+        self.conv = nn.Conv1d(in_channels=in_dims * num_joints, out_channels=in_dims * num_joints, kernel_size=3, stride=1, padding=1, groups=in_dims * num_joints)
+        self.pool = torch.nn.AvgPool1d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        b, t, h, w = x.shape
+        x = x.permute(0, 2, 3, 1).reshape(b, h * w, t)
+        x = self.conv(x)
+        x = self.pool(x)
+
+        x = x.reshape(b, h, w, t//2).permute(0, 3, 1, 2)
+        return x
+        
+
+class TemporalDecompressor(nn.Module):
+    def __init__(self, in_dims, num_joints, out_len_seq):
+        super().__init__()
+
+        self.deconv = nn.ConvTranspose1d(
+            in_channels=in_dims * num_joints,
+            out_channels=in_dims * num_joints,
+            kernel_size=3,   # Kernel size 3 for local context
+            stride=2,        # Stride 2 for upsampling
+            padding=1,       # Padding 1 to maintain size
+            output_padding=1, # Output padding to handle odd sizes like 243
+            groups=(num_joints)
+        )
+        self.out_len_seq = out_len_seq
+
+    
+    def forward(self, x, out_len):
+        b, t, h, w = x.shape
+        
+        # Merge h and w into channels
+        x = x.permute(0, 2, 3, 1).reshape(b, h * w, t)
+
+        if out_len % 2 != 0:
+            x = torch.functional.F.pad(x, (0, 1))  # Pad on the right side
+        
+        # Apply ConvTranspose1d to upsample
+        x = self.deconv(x)  # Output shape: [b, h * w, 243]
+
+        if x.shape[-1] > out_len:
+            x = x[:, :, :out_len]
+        # Reshape back to original spatial dimensions
+        x = x.reshape(b, h, w, out_len).permute(0, 3, 1, 2)
+        return x
     
 class DSTformer(nn.Module):
     def __init__(self, dim_in=3, dim_out=3, dim_feat=256, dim_rep=512,
                  depth=5, num_heads=8, mlp_ratio=4, 
                  num_joints=17, maxlen=243, 
-                 qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm, att_fuse=True):
+                 qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm, att_fuse=True, use_flash=False, use_temp_comp=False):
         super().__init__()
         self.dim_out = dim_out
         self.dim_feat = dim_feat
+        self.use_temp_comp = use_temp_comp
         self.joints_embed = nn.Linear(dim_in, dim_feat)
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks_st = nn.ModuleList([
             Block(
-                dim=dim_feat, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                dim=dim_feat, temporal_len=maxlen, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, 
-                st_mode="stage_st")
+                st_mode="stage_st", reduction=0, use_flash=use_flash)
             for i in range(depth)])
         self.blocks_ts = nn.ModuleList([
             Block(
-                dim=dim_feat, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                dim=dim_feat, temporal_len=maxlen, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, 
-                st_mode="stage_ts")
+                st_mode="stage_ts", reduction=0, use_flash=use_flash)
             for i in range(depth)])
         self.norm = norm_layer(dim_feat)
         if dim_rep:
@@ -298,8 +383,12 @@ class DSTformer(nn.Module):
         else:
             self.pre_logits = nn.Identity()
         self.head = nn.Linear(dim_rep, dim_out) if dim_out > 0 else nn.Identity()            
-        self.temp_embed = nn.Parameter(torch.zeros(1, maxlen, 1, dim_feat))
+        self.temp_embed = nn.Parameter(torch.zeros(1, maxlen//2 if self.use_temp_comp else maxlen, 1, dim_feat))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_joints, dim_feat))
+        print(self.use_temp_comp)
+        if self.use_temp_comp:
+            self.temporal_compressor = TemporalCompressor(dim_in, num_joints)
+            self.temporal_decompressor = TemporalDecompressor(dim_feat, num_joints, out_len_seq=maxlen)
         trunc_normal_(self.temp_embed, std=.02)
         trunc_normal_(self.pos_embed, std=.02)
         self.apply(self._init_weights)
@@ -326,7 +415,10 @@ class DSTformer(nn.Module):
         self.dim_out = dim_out
         self.head = nn.Linear(self.dim_feat, dim_out) if dim_out > 0 else nn.Identity()
 
-    def forward(self, x, return_rep=False):   
+    def forward(self, x, return_rep=False): 
+        Ft = x.shape[1]  
+        if self.use_temp_comp:
+            x = self.temporal_compressor(x)
         B, F, J, C = x.shape
         x = x.reshape(-1, J, C)
         BF = x.shape[0]
@@ -351,6 +443,8 @@ class DSTformer(nn.Module):
                 x = (x_st + x_ts)*0.5
         x = self.norm(x)
         x = x.reshape(B, F, J, -1)
+        if self.use_temp_comp:
+            x = self.temporal_decompressor(x,Ft)
         x = self.pre_logits(x)         # [B, F, J, dim_feat]
         if return_rep:
             return x

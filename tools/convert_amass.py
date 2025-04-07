@@ -9,8 +9,14 @@ sys.path.insert(0, os.getcwd())
 from lib.utils.utils_data import split_clips
 from tqdm import tqdm
 
-fileName = open('data/AMASS/amass_joints_h36m_60.pkl','rb')
-joints_all = pickle.load(fileName)
+joints_all = []
+with open('data/AMASS/amass_joints_h36m_60.pkl','rb') as pkl_file:
+    while True:
+        try:
+            joints_all.append(pickle.load(pkl_file))
+        except EOFError:
+            break
+
 
 joints_cam = []
 vid_list = []
@@ -63,5 +69,4 @@ for i in tqdm(range(num_clips)):
         }
     with open(os.path.join(save_path, "%08d.pkl" % i), "wb") as myprofile:  
         pickle.dump(data_dict, myprofile)
-
 

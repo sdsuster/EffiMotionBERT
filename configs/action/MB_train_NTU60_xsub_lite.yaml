@@ -1,28 +1,26 @@
 # General  
-finetune: True
+finetune: False
 partial_train: null
 
 # Traning 
 epochs: 300
-batch_size: 32 
+batch_size: 4 
 lr_backbone: 0.0001
-lr_head: 0.001
+lr_head: 0.0001
 weight_decay: 0.01
 lr_decay: 0.99
 
 # Model
 model_version: class
 maxlen: 243
-dim_feat: 512
-mlp_ratio: 2
+dim_feat: 256
+mlp_ratio: 4
 depth: 5
-dim_rep: 512
+dim_rep: 256
 num_heads: 8
 att_fuse: True
-use_flash: False
-use_temp_comp: False
 num_joints: 17
-hidden_dim: 2048
+hidden_dim: 512
 dropout_ratio: 0.5
 
 # Data
